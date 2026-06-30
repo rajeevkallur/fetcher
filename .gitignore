@@ -11,7 +11,7 @@ fetcher
 *.out
 
 # Downloaded output from running the command
-output.html
+*.html
 file.txt
 
 # Go workspace file
