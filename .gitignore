@@ -1,0 +1,20 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+fetcher
+
+# Test binary and coverage
+*.test
+*.out
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Editor/OS
+.DS_Store
+.idea/
+.vscode/
