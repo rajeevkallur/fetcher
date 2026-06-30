@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -22,7 +23,7 @@ func TestDownloadSuccess(t *testing.T) {
 	defer srv.Close()
 
 	var buf bytes.Buffer
-	n, status, err := download(context.Background(), &buf, srv.URL, 5*time.Second)
+	n, status, err := download(context.Background(), &buf, srv.URL, 5*time.Second, 0)
 	if err != nil {
 		t.Fatalf("download returned error: %v", err)
 	}
@@ -32,8 +33,8 @@ func TestDownloadSuccess(t *testing.T) {
 	if n != int64(len(body)) {
 		t.Errorf("n = %d, want %d", n, len(body))
 	}
-	if !strings.Contains(status, "200") {
-		t.Errorf("status = %q, want it to mention 200", status)
+	if status != http.StatusOK {
+		t.Errorf("status = %d, want %d", status, http.StatusOK)
 	}
 }
 
@@ -44,7 +45,7 @@ func TestDownloadNonSuccessStatus(t *testing.T) {
 	defer srv.Close()
 
 	var buf bytes.Buffer
-	_, _, err := download(context.Background(), &buf, srv.URL, 5*time.Second)
+	_, _, err := download(context.Background(), &buf, srv.URL, 5*time.Second, 0)
 	if err == nil {
 		t.Fatal("expected an error for 404 status, got nil")
 	}
@@ -55,9 +56,55 @@ func TestDownloadNonSuccessStatus(t *testing.T) {
 
 func TestDownloadBadURL(t *testing.T) {
 	var buf bytes.Buffer
-	_, _, err := download(context.Background(), &buf, "http://invalid.invalid.invalid", time.Second)
+	_, _, err := download(context.Background(), &buf, "http://invalid.invalid.invalid", time.Second, 0)
 	if err == nil {
 		t.Fatal("expected an error for an unreachable host, got nil")
+	}
+}
+
+func TestDownloadRetries(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) < 3 {
+			http.Error(w, "later", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	n, status, err := download(context.Background(), &buf, srv.URL, 5*time.Second, 3)
+	if err != nil {
+		t.Fatalf("download with retries returned error: %v", err)
+	}
+	if status != http.StatusOK {
+		t.Errorf("status = %d, want %d", status, http.StatusOK)
+	}
+	if buf.String() != "ok" {
+		t.Errorf("body = %q, want %q", buf.String(), "ok")
+	}
+	if n != 2 {
+		t.Errorf("n = %d, want 2", n)
+	}
+	if got := atomic.LoadInt32(&calls); got != 3 {
+		t.Errorf("server called %d times, want 3", got)
+	}
+}
+
+func TestDownloadRetriesExhausted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "down", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	_, status, err := download(context.Background(), &buf, srv.URL, 5*time.Second, 2)
+	if err == nil {
+		t.Fatal("expected an error after retries are exhausted, got nil")
+	}
+	if status != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", status, http.StatusServiceUnavailable)
 	}
 }
 
@@ -69,15 +116,15 @@ func TestFetchWritesFile(t *testing.T) {
 	defer srv.Close()
 
 	dst := filepath.Join(t.TempDir(), "out.txt")
-	fd := fetch(context.Background(), srv.URL, dst, 5*time.Second)
+	fd := fetch(context.Background(), srv.URL, dst, 5*time.Second, 0)
 	if fd.err != nil {
 		t.Fatalf("fetch returned error: %v", fd.err)
 	}
-	if fd.size != int64(len(body)) {
-		t.Errorf("fd.size = %d, want %d", fd.size, len(body))
+	if fd.filesize != int64(len(body)) {
+		t.Errorf("fd.filesize = %d, want %d", fd.filesize, len(body))
 	}
-	if !strings.Contains(fd.status, "200") {
-		t.Errorf("fd.status = %q, want it to mention 200", fd.status)
+	if fd.statusCode != http.StatusOK {
+		t.Errorf("fd.statusCode = %d, want %d", fd.statusCode, http.StatusOK)
 	}
 
 	got, err := os.ReadFile(dst)
@@ -102,7 +149,7 @@ func TestFetchAll(t *testing.T) {
 		srv.URL + "/c": filepath.Join(dir, "c.txt"),
 	}
 
-	if err := fetchAll(context.Background(), targets, 5*time.Second, 2); err != nil {
+	if err := fetchAll(context.Background(), targets, options{timeout: 5 * time.Second, concurrency: 2}); err != nil {
 		t.Fatalf("fetchAll returned error: %v", err)
 	}
 
@@ -128,7 +175,7 @@ func TestFetchAllReportsErrors(t *testing.T) {
 	targets := map[string]string{
 		srv.URL: filepath.Join(dir, "out.txt"),
 	}
-	if err := fetchAll(context.Background(), targets, 5*time.Second, 1); err == nil {
+	if err := fetchAll(context.Background(), targets, options{timeout: 5 * time.Second, concurrency: 1}); err == nil {
 		t.Fatal("expected an error when a download fails, got nil")
 	}
 }
@@ -152,7 +199,7 @@ func TestFetchAllReportsAllErrors(t *testing.T) {
 		srv.URL + "/c": filepath.Join(dir, "c.txt"),
 	}
 
-	err := fetchAll(context.Background(), targets, 5*time.Second, 2)
+	err := fetchAll(context.Background(), targets, options{timeout: 5 * time.Second, concurrency: 2})
 	if err == nil {
 		t.Fatal("expected an error when downloads fail, got nil")
 	}

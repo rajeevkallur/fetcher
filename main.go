@@ -3,17 +3,19 @@
 //
 // Usage:
 //
-//	fetcher [-o output] [-timeout duration] [-c n] [-list file] [url]
+//	fetcher [-o output] [-timeout duration] [-c n] [-retries n] [-q] [-list file] [url]
 //
 // With a single url, the body is written to -o (standard output by default).
 // With -list, each "url [output]" line in the file is downloaded concurrently.
 // With no arguments, a built-in set of URLs is downloaded concurrently.
+// Transient failures (network errors, 5xx) are retried up to -retries times
+// with exponential backoff, and -q suppresses progress output.
 //
 // Examples:
 //
 //	fetcher https://example.com
 //	fetcher -o page.html https://example.com
-//	fetcher -c 8 -list urls.txt
+//	fetcher -c 8 -retries 3 -list urls.txt
 package main
 
 import (
@@ -32,11 +34,21 @@ import (
 	"time"
 )
 
+// filedata records the outcome of downloading a single URL.
 type filedata struct {
 	url        string
 	dst        string
 	statusCode int
 	filesize   int64
+	err        error
+}
+
+// options holds the tunable settings for a run.
+type options struct {
+	timeout     time.Duration
+	concurrency int
+	retries     int
+	quiet       bool
 }
 
 func main() {
@@ -44,11 +56,20 @@ func main() {
 	timeout := flag.Duration("timeout", 30*time.Second, "HTTP request timeout")
 	list := flag.String("list", "", `file of "url [output]" lines to download concurrently`)
 	concurrency := flag.Int("c", 4, "maximum number of concurrent downloads")
+	retries := flag.Int("retries", 0, "retries for transient failures (network errors, 5xx)")
+	quiet := flag.Bool("q", false, "suppress per-file and summary output")
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [-o output] [-timeout duration] [-c n] [-list file] [url]\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [-o output] [-timeout duration] [-c n] [-retries n] [-q] [-list file] [url]\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	opts := options{
+		timeout:     *timeout,
+		concurrency: *concurrency,
+		retries:     *retries,
+		quiet:       *quiet,
+	}
 
 	// Cancel all in-flight downloads on Ctrl-C (SIGINT).
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -61,7 +82,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "fetcher: %v\n", err)
 			os.Exit(1)
 		}
-		if err := fetchAll(ctx, targets, *timeout, *concurrency); err != nil {
+		if err := fetchAll(ctx, targets, opts); err != nil {
 			fmt.Fprintf(os.Stderr, "fetcher: %v\n", err)
 			os.Exit(1)
 		}
@@ -77,18 +98,18 @@ func main() {
 			"https://go.dev":      "go.html",
 			"https://pkg.go.dev":  "pkg.html",
 		}
-		if err := fetchAll(ctx, targets, *timeout, *concurrency); err != nil {
+		if err := fetchAll(ctx, targets, opts); err != nil {
 			fmt.Fprintf(os.Stderr, "fetcher: %v\n", err)
 			os.Exit(1)
 		}
 	case 1:
-		fd := fetch(ctx, flag.Arg(0), *output, *timeout)
+		fd := fetch(ctx, flag.Arg(0), *output, opts.timeout, opts.retries)
 		if fd.err != nil {
 			fmt.Fprintf(os.Stderr, "fetcher: %v\n", fd.err)
 			os.Exit(1)
 		}
-		if *output != "-" {
-			fmt.Fprintf(os.Stderr, "wrote %d bytes to %s (%s)\n", fd.size, fd.dst, fd.status)
+		if *output != "-" && !opts.quiet {
+			fmt.Fprintf(os.Stderr, "wrote %d bytes to %s (%d)\n", fd.filesize, fd.dst, fd.statusCode)
 		}
 	default:
 		flag.Usage()
@@ -103,7 +124,8 @@ func main() {
 // returned together via errors.Join. Canceling ctx (e.g. on Ctrl-C) stops
 // dispatching new jobs and aborts in-flight requests. It prints a summary to
 // standard error.
-func fetchAll(ctx context.Context, targets map[string]string, timeout time.Duration, concurrency int) error {
+func fetchAll(ctx context.Context, targets map[string]string, opts options) error {
+	concurrency := opts.concurrency
 	if concurrency < 1 {
 		concurrency = 1
 	}
@@ -114,7 +136,7 @@ func fetchAll(ctx context.Context, targets map[string]string, timeout time.Durat
 	type job struct{ url, dst string }
 
 	jobs := make(chan job)
-	results := make(chan fileData)
+	results := make(chan filedata)
 
 	// Start the worker pool: each worker pulls jobs until the channel is closed.
 	var wg sync.WaitGroup
@@ -123,7 +145,7 @@ func fetchAll(ctx context.Context, targets map[string]string, timeout time.Durat
 		go func() {
 			defer wg.Done()
 			for j := range jobs {
-				results <- fetch(ctx, j.url, j.dst, timeout)
+				results <- fetch(ctx, j.url, j.dst, opts.timeout, opts.retries)
 			}
 		}()
 	}
@@ -149,7 +171,7 @@ func fetchAll(ctx context.Context, targets map[string]string, timeout time.Durat
 	// Collect every result until the results channel is closed.
 	var (
 		errs  []error
-		stats []fileData
+		stats []filedata
 	)
 	for fd := range results {
 		stats = append(stats, fd)
@@ -158,16 +180,17 @@ func fetchAll(ctx context.Context, targets map[string]string, timeout time.Durat
 		}
 	}
 
-	for _, fd := range stats {
-		if fd.err != nil {
-			fmt.Fprintf(os.Stderr, "FAIL %s: %v\n", fd.url, fd.err)
-			continue
+	if !opts.quiet {
+		for _, fd := range stats {
+			if fd.err != nil {
+				fmt.Fprintf(os.Stderr, "FAIL %s: %v\n", fd.url, fd.err)
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "OK   %s -> %s (%d, %d bytes)\n", fd.url, fd.dst, fd.statusCode, fd.filesize)
 		}
-		fmt.Fprintf(os.Stderr, "OK   %s -> %s (%s, %d bytes)\n", fd.url, fd.dst, fd.status, fd.size)
+		succeeded := len(stats) - len(errs)
+		fmt.Fprintf(os.Stderr, "done: %d succeeded, %d failed (of %d)\n", succeeded, len(errs), len(targets))
 	}
-
-	succeeded := len(stats) - len(errs)
-	fmt.Fprintf(os.Stderr, "done: %d succeeded, %d failed (of %d)\n", succeeded, len(errs), len(targets))
 	return errors.Join(errs...)
 }
 
@@ -220,22 +243,12 @@ func outputName(rawURL string) string {
 	return name + ".html"
 }
 
-// fileData records the outcome of downloading a single URL: where it was saved,
-// the number of bytes written, the HTTP status, and any error encountered.
-type fileData struct {
-	url    string
-	dst    string
-	size   int64
-	status string
-	err    error
-}
-
 // fetch retrieves url and writes the response body to dst. If dst is "-" the
 // body is written to standard output; otherwise dst is treated as a file path.
-// The download honors cancellation of ctx. The outcome (size, status, error) is
-// reported in the returned fileData.
-func fetch(ctx context.Context, url, dst string, timeout time.Duration) fileData {
-	fd := fileData{url: url, dst: dst}
+// The download honors cancellation of ctx and retries transient failures up to
+// retries times. The outcome is reported in the returned filedata.
+func fetch(ctx context.Context, url, dst string, timeout time.Duration, retries int) filedata {
+	fd := filedata{url: url, dst: dst}
 
 	out := os.Stdout
 	if dst != "-" {
@@ -248,37 +261,66 @@ func fetch(ctx context.Context, url, dst string, timeout time.Duration) fileData
 		out = f
 	}
 
-	fd.size, fd.status, fd.err = download(ctx, out, url, timeout)
+	fd.filesize, fd.statusCode, fd.err = download(ctx, out, url, timeout, retries)
 	return fd
 }
 
 // download performs an HTTP GET on url and copies the response body to w,
-// returning the number of bytes written and the HTTP status line. The request
-// is bounded by timeout and is canceled if ctx is canceled. It returns an error
-// if the request fails or the server responds with a non-success status code.
-func download(ctx context.Context, w io.Writer, url string, timeout time.Duration) (int64, string, error) {
+// returning the number of bytes written and the HTTP status code. The request
+// is bounded by timeout and is canceled if ctx is canceled. Transient failures
+// (network errors or 5xx responses) are retried up to retries times with
+// exponential backoff. No bytes are written to w until a successful response is
+// received, so a retry never corrupts the output.
+func download(ctx context.Context, w io.Writer, url string, timeout time.Duration, retries int) (int64, int, error) {
+	var (
+		n    int64
+		code int
+		err  error
+	)
+	for attempt := 0; ; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(1<<uint(attempt-1)) * 250 * time.Millisecond
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return 0, 0, ctx.Err()
+			}
+		}
+
+		var retryable bool
+		n, code, err, retryable = downloadOnce(ctx, w, url, timeout)
+		if err == nil || !retryable || attempt >= retries {
+			return n, code, err
+		}
+	}
+}
+
+// downloadOnce performs a single HTTP GET attempt. retryable reports whether the
+// failure is worth retrying (network error or 5xx) and is only ever true before
+// any bytes are written to w.
+func downloadOnce(ctx context.Context, w io.Writer, url string, timeout time.Duration) (n int64, code int, err error, retryable bool) {
 	// Per-request timeout that also respects cancellation of the parent ctx.
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return 0, "", fmt.Errorf("could not build request for %q: %w", url, err)
+		return 0, 0, fmt.Errorf("could not build request for %q: %w", url, err), false
 	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return 0, "", fmt.Errorf("could not get %q: %w", url, err)
+		return 0, 0, fmt.Errorf("could not get %q: %w", url, err), true
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= http.StatusMultipleChoices {
-		return 0, resp.Status, fmt.Errorf("unexpected HTTP status: %s", resp.Status)
+		return 0, resp.StatusCode, fmt.Errorf("unexpected HTTP status: %s", resp.Status), resp.StatusCode >= http.StatusInternalServerError
 	}
 
-	n, err := io.Copy(w, resp.Body)
+	n, err = io.Copy(w, resp.Body)
 	if err != nil {
-		return n, resp.Status, fmt.Errorf("error writing body: %w", err)
+		return n, resp.StatusCode, fmt.Errorf("error writing body: %w", err), false
 	}
-	return n, resp.Status, nil
+	return n, resp.StatusCode, nil, false
 }

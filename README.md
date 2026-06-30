@@ -15,7 +15,7 @@ go install github.com/rajeevkallur/fetcher@latest
 ## Usage
 
 ```sh
-fetcher [-o output] [-timeout duration] [-c n] [-list file] [url]
+fetcher [-o output] [-timeout duration] [-c n] [-retries n] [-q] [-list file] [url]
 ```
 
 - A single `url` writes the body to `-o` (standard output by default).
@@ -23,14 +23,17 @@ fetcher [-o output] [-timeout duration] [-c n] [-list file] [url]
 - With **no arguments**, a built-in set of URLs is downloaded concurrently.
 
 Concurrent downloads run in a bounded worker pool (`-c`). Every URL is attempted
-regardless of individual failures, and all errors are reported together. Pressing
-Ctrl-C cancels any in-flight downloads.
+regardless of individual failures, and all errors are reported together. Transient
+failures (network errors and `5xx` responses) are retried up to `-retries` times
+with exponential backoff. Pressing Ctrl-C cancels any in-flight downloads.
 
 Flags:
 
 - `-o` — output file (`-` for standard output, the default)
 - `-timeout` — HTTP request timeout (default `30s`)
 - `-c` — maximum number of concurrent downloads (default `4`)
+- `-retries` — retries for transient failures (default `0`)
+- `-q` — suppress per-file and summary output
 - `-list` — file of `url [output]` lines to download concurrently
 
 ### List file format
@@ -49,9 +52,13 @@ fetcher https://example.com              # print to stdout
 fetcher -o page.html https://example.com # save to a file
 fetcher -timeout 5s https://example.com  # custom timeout
 fetcher -c 8 -list urls.txt              # concurrent download from a list
+fetcher -retries 3 -list urls.txt        # retry transient failures
+fetcher -q -list urls.txt                # suppress progress output
 fetcher                                  # concurrently fetch the built-in URL set
 ```
 
 ## License
 
 Released under the [MIT License](LICENSE).
+
+See the [changelog](CHANGELOG.md) for release history.
