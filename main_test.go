@@ -91,7 +91,7 @@ func TestFetchAll(t *testing.T) {
 		srv.URL + "/c": filepath.Join(dir, "c.txt"),
 	}
 
-	if err := fetchAll(targets, 5*time.Second); err != nil {
+	if err := fetchAll(targets, 5*time.Second, 2); err != nil {
 		t.Fatalf("fetchAll returned error: %v", err)
 	}
 
@@ -117,7 +117,57 @@ func TestFetchAllReportsErrors(t *testing.T) {
 	targets := map[string]string{
 		srv.URL: filepath.Join(dir, "out.txt"),
 	}
-	if err := fetchAll(targets, 5*time.Second); err == nil {
+	if err := fetchAll(targets, 5*time.Second, 1); err == nil {
 		t.Fatal("expected an error when a download fails, got nil")
+	}
+}
+
+func TestLoadTargets(t *testing.T) {
+	dir := t.TempDir()
+	listPath := filepath.Join(dir, "urls.txt")
+	content := "# comment\n\nhttps://a.example.com out_a.html\nhttps://b.example.com/path\n"
+	if err := os.WriteFile(listPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("writing list file: %v", err)
+	}
+
+	targets, err := loadTargets(listPath)
+	if err != nil {
+		t.Fatalf("loadTargets returned error: %v", err)
+	}
+	if len(targets) != 2 {
+		t.Fatalf("len(targets) = %d, want 2", len(targets))
+	}
+	if got := targets["https://a.example.com"]; got != "out_a.html" {
+		t.Errorf("explicit output = %q, want %q", got, "out_a.html")
+	}
+	if got := targets["https://b.example.com/path"]; got != "b.example.com_path.html" {
+		t.Errorf("derived output = %q, want %q", got, "b.example.com_path.html")
+	}
+}
+
+func TestLoadTargetsErrors(t *testing.T) {
+	if _, err := loadTargets(filepath.Join(t.TempDir(), "missing.txt")); err == nil {
+		t.Error("expected an error for a missing file, got nil")
+	}
+
+	empty := filepath.Join(t.TempDir(), "empty.txt")
+	if err := os.WriteFile(empty, []byte("# only a comment\n"), 0o644); err != nil {
+		t.Fatalf("writing empty list: %v", err)
+	}
+	if _, err := loadTargets(empty); err == nil {
+		t.Error("expected an error for a list with no URLs, got nil")
+	}
+}
+
+func TestOutputName(t *testing.T) {
+	cases := map[string]string{
+		"https://example.com":     "example.com.html",
+		"https://example.com/a/b": "example.com_a_b.html",
+		"not a url":               "download.out",
+	}
+	for in, want := range cases {
+		if got := outputName(in); got != want {
+			t.Errorf("outputName(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

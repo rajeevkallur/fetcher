@@ -15,17 +15,28 @@ go install github.com/rajeevkallur/fetcher@latest
 ## Usage
 
 ```sh
-fetcher [-o output] [-timeout duration] [url]
+fetcher [-o output] [-timeout duration] [-c n] [-list file] [url]
 ```
 
-With a single `url`, the body is written to `-o` (standard output by default).
-With **no arguments**, fetcher downloads a built-in set of URLs **concurrently**,
-saving each to its own output file.
+- A single `url` writes the body to `-o` (standard output by default).
+- `-list file` downloads every `url [output]` line in the file **concurrently**.
+- With **no arguments**, a built-in set of URLs is downloaded concurrently.
 
 Flags:
 
 - `-o` — output file (`-` for standard output, the default)
 - `-timeout` — HTTP request timeout (default `30s`)
+- `-c` — maximum number of concurrent downloads (default `4`)
+- `-list` — file of `url [output]` lines to download concurrently
+
+### List file format
+
+```text
+# lines starting with # are comments; blank lines are ignored
+https://example.com            example.html
+https://go.dev                 go.html
+https://pkg.go.dev             # output name derived from the URL
+```
 
 ### Examples
 
@@ -33,6 +44,7 @@ Flags:
 fetcher https://example.com              # print to stdout
 fetcher -o page.html https://example.com # save to a file
 fetcher -timeout 5s https://example.com  # custom timeout
+fetcher -c 8 -list urls.txt              # concurrent download from a list
 fetcher                                  # concurrently fetch the built-in URL set
 ```
 
