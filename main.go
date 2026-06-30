@@ -44,18 +44,6 @@ func main() {
 // fetch retrieves url and writes the response body to dst. If dst is "-" the
 // body is written to standard output; otherwise dst is treated as a file path.
 func fetch(url, dst string, timeout time.Duration) error {
-	client := &http.Client{Timeout: timeout}
-
-	resp, err := client.Get(url)
-	if err != nil {
-		return fmt.Errorf("could not get %q: %w", url, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("unexpected HTTP status: %s", resp.Status)
-	}
-
 	out := os.Stdout
 	if dst != "-" {
 		f, err := os.Create(dst)
@@ -66,13 +54,36 @@ func fetch(url, dst string, timeout time.Duration) error {
 		out = f
 	}
 
-	n, err := io.Copy(out, resp.Body)
+	n, err := download(out, url, timeout)
 	if err != nil {
-		return fmt.Errorf("error writing body: %w", err)
+		return err
 	}
 
 	if dst != "-" {
 		fmt.Fprintf(os.Stderr, "wrote %d bytes to %s\n", n, dst)
 	}
 	return nil
+}
+
+// download performs an HTTP GET on url and copies the response body to w,
+// returning the number of bytes written. It returns an error if the request
+// fails or the server responds with a non-success status code.
+func download(w io.Writer, url string, timeout time.Duration) (int64, error) {
+	client := &http.Client{Timeout: timeout}
+
+	resp, err := client.Get(url)
+	if err != nil {
+		return 0, fmt.Errorf("could not get %q: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= http.StatusMultipleChoices {
+		return 0, fmt.Errorf("unexpected HTTP status: %s", resp.Status)
+	}
+
+	n, err := io.Copy(w, resp.Body)
+	if err != nil {
+		return n, fmt.Errorf("error writing body: %w", err)
+	}
+	return n, nil
 }
