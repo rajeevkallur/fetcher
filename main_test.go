@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -21,7 +22,7 @@ func TestDownloadSuccess(t *testing.T) {
 	defer srv.Close()
 
 	var buf bytes.Buffer
-	n, err := download(&buf, srv.URL, 5*time.Second)
+	n, err := download(context.Background(), &buf, srv.URL, 5*time.Second)
 	if err != nil {
 		t.Fatalf("download returned error: %v", err)
 	}
@@ -40,7 +41,7 @@ func TestDownloadNonSuccessStatus(t *testing.T) {
 	defer srv.Close()
 
 	var buf bytes.Buffer
-	_, err := download(&buf, srv.URL, 5*time.Second)
+	_, err := download(context.Background(), &buf, srv.URL, 5*time.Second)
 	if err == nil {
 		t.Fatal("expected an error for 404 status, got nil")
 	}
@@ -51,7 +52,7 @@ func TestDownloadNonSuccessStatus(t *testing.T) {
 
 func TestDownloadBadURL(t *testing.T) {
 	var buf bytes.Buffer
-	_, err := download(&buf, "http://invalid.invalid.invalid", time.Second)
+	_, err := download(context.Background(), &buf, "http://invalid.invalid.invalid", time.Second)
 	if err == nil {
 		t.Fatal("expected an error for an unreachable host, got nil")
 	}
@@ -65,7 +66,7 @@ func TestFetchWritesFile(t *testing.T) {
 	defer srv.Close()
 
 	dst := filepath.Join(t.TempDir(), "out.txt")
-	if err := fetch(srv.URL, dst, 5*time.Second); err != nil {
+	if err := fetch(context.Background(), srv.URL, dst, 5*time.Second); err != nil {
 		t.Fatalf("fetch returned error: %v", err)
 	}
 
@@ -91,7 +92,7 @@ func TestFetchAll(t *testing.T) {
 		srv.URL + "/c": filepath.Join(dir, "c.txt"),
 	}
 
-	if err := fetchAll(targets, 5*time.Second, 2); err != nil {
+	if err := fetchAll(context.Background(), targets, 5*time.Second, 2); err != nil {
 		t.Fatalf("fetchAll returned error: %v", err)
 	}
 
@@ -117,7 +118,7 @@ func TestFetchAllReportsErrors(t *testing.T) {
 	targets := map[string]string{
 		srv.URL: filepath.Join(dir, "out.txt"),
 	}
-	if err := fetchAll(targets, 5*time.Second, 1); err == nil {
+	if err := fetchAll(context.Background(), targets, 5*time.Second, 1); err == nil {
 		t.Fatal("expected an error when a download fails, got nil")
 	}
 }

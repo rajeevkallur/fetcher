@@ -18,16 +18,19 @@ package main
 
 import (
 	"bufio"
-	"errors"
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 func main() {
@@ -41,6 +44,10 @@ func main() {
 	}
 	flag.Parse()
 
+	// Cancel all in-flight downloads on Ctrl-C (SIGINT).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
 	// -list takes precedence: download every entry from the file concurrently.
 	if *list != "" {
 		targets, err := loadTargets(*list)
@@ -48,7 +55,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "fetcher: %v\n", err)
 			os.Exit(1)
 		}
-		if err := fetchAll(targets, *timeout, *concurrency); err != nil {
+		if err := fetchAll(ctx, targets, *timeout, *concurrency); err != nil {
 			fmt.Fprintf(os.Stderr, "fetcher: %v\n", err)
 			os.Exit(1)
 		}
@@ -64,12 +71,12 @@ func main() {
 			"https://go.dev":      "go.html",
 			"https://pkg.go.dev":  "pkg.html",
 		}
-		if err := fetchAll(targets, *timeout, *concurrency); err != nil {
+		if err := fetchAll(ctx, targets, *timeout, *concurrency); err != nil {
 			fmt.Fprintf(os.Stderr, "fetcher: %v\n", err)
 			os.Exit(1)
 		}
 	case 1:
-		if err := fetch(flag.Arg(0), *output, *timeout); err != nil {
+		if err := fetch(ctx, flag.Arg(0), *output, *timeout); err != nil {
 			fmt.Fprintf(os.Stderr, "fetcher: %v\n", err)
 			os.Exit(1)
 		}
@@ -79,50 +86,36 @@ func main() {
 	}
 }
 
-// fetchAll downloads every url in targets concurrently, running each download
-// in its own goroutine while limiting the number running at once to concurrency.
-// Each response body is written to its associated output file path. It prints a
-// summary to standard error and returns a combined error describing any
-// downloads that failed.
-//
-// Concurrency model:
-//   - sem is a counting semaphore (a buffered channel) that caps the number of
-//     in-flight goroutines at concurrency.
-//   - wg waits for every goroutine to finish before returning.
-//   - mu guards the shared errs slice, since goroutines append to it in parallel.
-func fetchAll(targets map[string]string, timeout time.Duration, concurrency int) error {
+// fetchAll downloads every url in targets concurrently. It uses an errgroup
+// whose limit caps the number of in-flight downloads at concurrency (a bounded
+// worker pool). The group's context is canceled as soon as any download fails,
+// or when the caller cancels ctx (e.g. on Ctrl-C), which aborts the remaining
+// in-flight requests. It prints a summary to standard error and returns the
+// first error encountered, if any.
+func fetchAll(ctx context.Context, targets map[string]string, timeout time.Duration, concurrency int) error {
 	if concurrency < 1 {
 		concurrency = 1
 	}
 
-	var (
-		wg   sync.WaitGroup
-		mu   sync.Mutex
-		errs []error
-	)
-	sem := make(chan struct{}, concurrency)
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(concurrency) // bounded pool: at most concurrency goroutines run at once
 
+	var succeeded atomic.Int64
 	for url, dst := range targets {
-		wg.Add(1)
-		sem <- struct{}{} // acquire a worker slot (blocks once concurrency are active)
-		// Each download runs concurrently in its own goroutine.
-		go func(url, dst string) {
-			defer wg.Done()
-			defer func() { <-sem }() // release the slot for the next download
-			if err := fetch(url, dst, timeout); err != nil {
-				mu.Lock()
-				errs = append(errs, err)
-				mu.Unlock()
+		g.Go(func() error {
+			if err := fetch(ctx, url, dst, timeout); err != nil {
+				return err
 			}
-		}(url, dst)
+			succeeded.Add(1)
+			return nil
+		})
 	}
 
-	wg.Wait() // block until all goroutines have completed
+	err := g.Wait() // blocks until all goroutines finish or one fails
 
-	failed := len(errs)
-	succeeded := len(targets) - failed
-	fmt.Fprintf(os.Stderr, "done: %d succeeded, %d failed (of %d)\n", succeeded, failed, len(targets))
-	return errors.Join(errs...)
+	ok := int(succeeded.Load())
+	fmt.Fprintf(os.Stderr, "done: %d succeeded, %d failed (of %d)\n", ok, len(targets)-ok, len(targets))
+	return err
 }
 
 // loadTargets reads URL/output-file pairs from path. Each non-empty, non-comment
@@ -176,7 +169,8 @@ func outputName(rawURL string) string {
 
 // fetch retrieves url and writes the response body to dst. If dst is "-" the
 // body is written to standard output; otherwise dst is treated as a file path.
-func fetch(url, dst string, timeout time.Duration) error {
+// The download honors cancellation of ctx.
+func fetch(ctx context.Context, url, dst string, timeout time.Duration) error {
 	out := os.Stdout
 	if dst != "-" {
 		f, err := os.Create(dst)
@@ -187,7 +181,7 @@ func fetch(url, dst string, timeout time.Duration) error {
 		out = f
 	}
 
-	n, err := download(out, url, timeout)
+	n, err := download(ctx, out, url, timeout)
 	if err != nil {
 		return err
 	}
@@ -199,12 +193,20 @@ func fetch(url, dst string, timeout time.Duration) error {
 }
 
 // download performs an HTTP GET on url and copies the response body to w,
-// returning the number of bytes written. It returns an error if the request
-// fails or the server responds with a non-success status code.
-func download(w io.Writer, url string, timeout time.Duration) (int64, error) {
-	client := &http.Client{Timeout: timeout}
+// returning the number of bytes written. The request is bounded by timeout and
+// is canceled if ctx is canceled. It returns an error if the request fails or
+// the server responds with a non-success status code.
+func download(ctx context.Context, w io.Writer, url string, timeout time.Duration) (int64, error) {
+	// Per-request timeout that also respects cancellation of the parent ctx.
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
-	resp, err := client.Get(url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, fmt.Errorf("could not build request for %q: %w", url, err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return 0, fmt.Errorf("could not get %q: %w", url, err)
 	}
