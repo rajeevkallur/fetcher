@@ -1,0 +1,8 @@
+version: "2"
+
+linters:
+  exclusions:
+    presets:
+      # Ignore errcheck on idiomatic, low-value error returns such as
+      # deferred *.Close and fmt.Fprint* to stderr/stdout.
+      - std-error-handling
