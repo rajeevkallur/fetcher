@@ -13,11 +13,13 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -25,20 +27,59 @@ func main() {
 	output := flag.String("o", "-", `output file ("-" for standard output)`)
 	timeout := flag.Duration("timeout", 30*time.Second, "HTTP request timeout")
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [-o output] [-timeout duration] <url>\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [-o output] [-timeout duration] [url]\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
 
-	if flag.NArg() != 1 {
+	switch flag.NArg() {
+	case 0:
+		// No URL given: download a built-in set of URLs concurrently,
+		// each saved to its own output file.
+		targets := map[string]string{
+			"https://example.com": "example.html",
+			"https://go.dev":      "go.html",
+			"https://pkg.go.dev":  "pkg.html",
+		}
+		if err := fetchAll(targets, *timeout); err != nil {
+			fmt.Fprintf(os.Stderr, "fetcher: %v\n", err)
+			os.Exit(1)
+		}
+	case 1:
+		if err := fetch(flag.Arg(0), *output, *timeout); err != nil {
+			fmt.Fprintf(os.Stderr, "fetcher: %v\n", err)
+			os.Exit(1)
+		}
+	default:
 		flag.Usage()
 		os.Exit(2)
 	}
+}
 
-	if err := fetch(flag.Arg(0), *output, *timeout); err != nil {
-		fmt.Fprintf(os.Stderr, "fetcher: %v\n", err)
-		os.Exit(1)
+// fetchAll downloads every url in targets concurrently, writing each response
+// body to its associated output file path. It waits for all downloads to
+// finish and returns a combined error describing any that failed.
+func fetchAll(targets map[string]string, timeout time.Duration) error {
+	var (
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		errs []error
+	)
+
+	for url, dst := range targets {
+		wg.Add(1)
+		go func(url, dst string) {
+			defer wg.Done()
+			if err := fetch(url, dst, timeout); err != nil {
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
+			}
+		}(url, dst)
 	}
+
+	wg.Wait()
+	return errors.Join(errs...)
 }
 
 // fetch retrieves url and writes the response body to dst. If dst is "-" the

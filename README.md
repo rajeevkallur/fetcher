@@ -15,8 +15,12 @@ go install github.com/rajeevkallur/fetcher@latest
 ## Usage
 
 ```sh
-fetcher [-o output] [-timeout duration] <url>
+fetcher [-o output] [-timeout duration] [url]
 ```
+
+With a single `url`, the body is written to `-o` (standard output by default).
+With **no arguments**, fetcher downloads a built-in set of URLs **concurrently**,
+saving each to its own output file.
 
 Flags:
 
@@ -29,6 +33,7 @@ Flags:
 fetcher https://example.com              # print to stdout
 fetcher -o page.html https://example.com # save to a file
 fetcher -timeout 5s https://example.com  # custom timeout
+fetcher                                  # concurrently fetch the built-in URL set
 ```
 
 ## License

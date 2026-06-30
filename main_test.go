@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -74,5 +75,49 @@ func TestFetchWritesFile(t *testing.T) {
 	}
 	if string(got) != body {
 		t.Errorf("file = %q, want %q", got, body)
+	}
+}
+
+func TestFetchAll(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "content for %s", r.URL.Path)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	targets := map[string]string{
+		srv.URL + "/a": filepath.Join(dir, "a.txt"),
+		srv.URL + "/b": filepath.Join(dir, "b.txt"),
+		srv.URL + "/c": filepath.Join(dir, "c.txt"),
+	}
+
+	if err := fetchAll(targets, 5*time.Second); err != nil {
+		t.Fatalf("fetchAll returned error: %v", err)
+	}
+
+	for url, dst := range targets {
+		got, err := os.ReadFile(dst)
+		if err != nil {
+			t.Fatalf("reading %s: %v", dst, err)
+		}
+		want := "content for " + strings.TrimPrefix(url, srv.URL)
+		if string(got) != want {
+			t.Errorf("%s = %q, want %q", dst, got, want)
+		}
+	}
+}
+
+func TestFetchAllReportsErrors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nope", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	targets := map[string]string{
+		srv.URL: filepath.Join(dir, "out.txt"),
+	}
+	if err := fetchAll(targets, 5*time.Second); err == nil {
+		t.Fatal("expected an error when a download fails, got nil")
 	}
 }
