@@ -79,10 +79,17 @@ func main() {
 	}
 }
 
-// fetchAll downloads every url in targets, running at most concurrency downloads
-// at a time. Each response body is written to its associated output file path.
-// It prints a summary to standard error and returns a combined error describing
-// any downloads that failed.
+// fetchAll downloads every url in targets concurrently, running each download
+// in its own goroutine while limiting the number running at once to concurrency.
+// Each response body is written to its associated output file path. It prints a
+// summary to standard error and returns a combined error describing any
+// downloads that failed.
+//
+// Concurrency model:
+//   - sem is a counting semaphore (a buffered channel) that caps the number of
+//     in-flight goroutines at concurrency.
+//   - wg waits for every goroutine to finish before returning.
+//   - mu guards the shared errs slice, since goroutines append to it in parallel.
 func fetchAll(targets map[string]string, timeout time.Duration, concurrency int) error {
 	if concurrency < 1 {
 		concurrency = 1
@@ -97,10 +104,11 @@ func fetchAll(targets map[string]string, timeout time.Duration, concurrency int)
 
 	for url, dst := range targets {
 		wg.Add(1)
-		sem <- struct{}{} // acquire a worker slot
+		sem <- struct{}{} // acquire a worker slot (blocks once concurrency are active)
+		// Each download runs concurrently in its own goroutine.
 		go func(url, dst string) {
 			defer wg.Done()
-			defer func() { <-sem }() // release the slot
+			defer func() { <-sem }() // release the slot for the next download
 			if err := fetch(url, dst, timeout); err != nil {
 				mu.Lock()
 				errs = append(errs, err)
@@ -109,7 +117,7 @@ func fetchAll(targets map[string]string, timeout time.Duration, concurrency int)
 		}(url, dst)
 	}
 
-	wg.Wait()
+	wg.Wait() // block until all goroutines have completed
 
 	failed := len(errs)
 	succeeded := len(targets) - failed
