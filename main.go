@@ -32,6 +32,13 @@ import (
 	"time"
 )
 
+type filedata struct {
+	url        string
+	dst        string
+	statusCode int
+	filesize   int64
+}
+
 func main() {
 	output := flag.String("o", "-", `output file ("-" for standard output)`)
 	timeout := flag.Duration("timeout", 30*time.Second, "HTTP request timeout")
@@ -75,9 +82,13 @@ func main() {
 			os.Exit(1)
 		}
 	case 1:
-		if err := fetch(ctx, flag.Arg(0), *output, *timeout); err != nil {
-			fmt.Fprintf(os.Stderr, "fetcher: %v\n", err)
+		fd := fetch(ctx, flag.Arg(0), *output, *timeout)
+		if fd.err != nil {
+			fmt.Fprintf(os.Stderr, "fetcher: %v\n", fd.err)
 			os.Exit(1)
+		}
+		if *output != "-" {
+			fmt.Fprintf(os.Stderr, "wrote %d bytes to %s (%s)\n", fd.size, fd.dst, fd.status)
 		}
 	default:
 		flag.Usage()
@@ -103,7 +114,7 @@ func fetchAll(ctx context.Context, targets map[string]string, timeout time.Durat
 	type job struct{ url, dst string }
 
 	jobs := make(chan job)
-	results := make(chan error)
+	results := make(chan fileData)
 
 	// Start the worker pool: each worker pulls jobs until the channel is closed.
 	var wg sync.WaitGroup
@@ -137,17 +148,25 @@ func fetchAll(ctx context.Context, targets map[string]string, timeout time.Durat
 
 	// Collect every result until the results channel is closed.
 	var (
-		errs      []error
-		succeeded int
+		errs  []error
+		stats []fileData
 	)
-	for err := range results {
-		if err != nil {
-			errs = append(errs, err)
-		} else {
-			succeeded++
+	for fd := range results {
+		stats = append(stats, fd)
+		if fd.err != nil {
+			errs = append(errs, fd.err)
 		}
 	}
 
+	for _, fd := range stats {
+		if fd.err != nil {
+			fmt.Fprintf(os.Stderr, "FAIL %s: %v\n", fd.url, fd.err)
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "OK   %s -> %s (%s, %d bytes)\n", fd.url, fd.dst, fd.status, fd.size)
+	}
+
+	succeeded := len(stats) - len(errs)
 	fmt.Fprintf(os.Stderr, "done: %d succeeded, %d failed (of %d)\n", succeeded, len(errs), len(targets))
 	return errors.Join(errs...)
 }
@@ -201,58 +220,65 @@ func outputName(rawURL string) string {
 	return name + ".html"
 }
 
+// fileData records the outcome of downloading a single URL: where it was saved,
+// the number of bytes written, the HTTP status, and any error encountered.
+type fileData struct {
+	url    string
+	dst    string
+	size   int64
+	status string
+	err    error
+}
+
 // fetch retrieves url and writes the response body to dst. If dst is "-" the
 // body is written to standard output; otherwise dst is treated as a file path.
-// The download honors cancellation of ctx.
-func fetch(ctx context.Context, url, dst string, timeout time.Duration) error {
+// The download honors cancellation of ctx. The outcome (size, status, error) is
+// reported in the returned fileData.
+func fetch(ctx context.Context, url, dst string, timeout time.Duration) fileData {
+	fd := fileData{url: url, dst: dst}
+
 	out := os.Stdout
 	if dst != "-" {
 		f, err := os.Create(dst)
 		if err != nil {
-			return fmt.Errorf("could not create %q: %w", dst, err)
+			fd.err = fmt.Errorf("could not create %q: %w", dst, err)
+			return fd
 		}
 		defer f.Close()
 		out = f
 	}
 
-	n, err := download(ctx, out, url, timeout)
-	if err != nil {
-		return err
-	}
-
-	if dst != "-" {
-		fmt.Fprintf(os.Stderr, "wrote %d bytes to %s\n", n, dst)
-	}
-	return nil
+	fd.size, fd.status, fd.err = download(ctx, out, url, timeout)
+	return fd
 }
 
 // download performs an HTTP GET on url and copies the response body to w,
-// returning the number of bytes written. The request is bounded by timeout and
-// is canceled if ctx is canceled. It returns an error if the request fails or
-// the server responds with a non-success status code.
-func download(ctx context.Context, w io.Writer, url string, timeout time.Duration) (int64, error) {
+// returning the number of bytes written and the HTTP status line. The request
+// is bounded by timeout and is canceled if ctx is canceled. It returns an error
+// if the request fails or the server responds with a non-success status code.
+func download(ctx context.Context, w io.Writer, url string, timeout time.Duration) (int64, string, error) {
 	// Per-request timeout that also respects cancellation of the parent ctx.
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return 0, fmt.Errorf("could not build request for %q: %w", url, err)
+		return 0, "", fmt.Errorf("could not build request for %q: %w", url, err)
 	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("could not get %q: %w", url, err)
+		return 0, "", fmt.Errorf("could not get %q: %w", url, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= http.StatusMultipleChoices {
-		return 0, fmt.Errorf("unexpected HTTP status: %s", resp.Status)
+		return 0, resp.Status, fmt.Errorf("unexpected HTTP status: %s", resp.Status)
 	}
 
 	n, err := io.Copy(w, resp.Body)
 	if err != nil {
-		return n, fmt.Errorf("error writing body: %w", err)
+		return n, resp.Status, fmt.Errorf("error writing body: %w", err)
 	}
-	return n, nil
+	return n, resp.Status, nil
 }
