@@ -10,6 +10,10 @@ fetcher
 *.test
 *.out
 
+# Downloaded output from running the command
+output.html
+file.txt
+
 # Go workspace file
 go.work
 go.work.sum
