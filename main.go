@@ -30,8 +30,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/sync/errgroup"
 )
 
 func main() {
@@ -87,42 +85,70 @@ func main() {
 	}
 }
 
-// fetchAll downloads every url in targets concurrently. It uses an errgroup
-// whose limit caps the number of in-flight downloads at concurrency (a bounded
-// worker pool). Every target is attempted regardless of individual failures;
-// the errors are collected and returned together via errors.Join. Cancellation
-// of ctx (e.g. on Ctrl-C) still aborts in-flight requests. It prints a summary
-// to standard error.
+// fetchAll downloads every url in targets using a classic channel-based worker
+// pool: a fixed set of concurrency worker goroutines pull jobs off the jobs
+// channel and push their result onto the results channel. Every target is
+// attempted regardless of individual failures; the errors are collected and
+// returned together via errors.Join. Canceling ctx (e.g. on Ctrl-C) stops
+// dispatching new jobs and aborts in-flight requests. It prints a summary to
+// standard error.
 func fetchAll(ctx context.Context, targets map[string]string, timeout time.Duration, concurrency int) error {
 	if concurrency < 1 {
 		concurrency = 1
 	}
-
-	// Plain errgroup (no WithContext) so one failure does not cancel the rest;
-	// Ctrl-C cancellation is carried by the caller-supplied ctx instead.
-	var g errgroup.Group
-	g.SetLimit(concurrency) // bounded pool: at most concurrency goroutines run at once
-
-	var (
-		mu   sync.Mutex
-		errs []error
-	)
-	for url, dst := range targets {
-		g.Go(func() error {
-			if err := fetch(ctx, url, dst, timeout); err != nil {
-				mu.Lock()
-				errs = append(errs, err)
-				mu.Unlock()
-			}
-			return nil // never cancel siblings; failures are collected above
-		})
+	if concurrency > len(targets) {
+		concurrency = len(targets) // no point starting more workers than jobs
 	}
 
-	g.Wait() // blocks until every download has finished
+	type job struct{ url, dst string }
 
-	failed := len(errs)
-	succeeded := len(targets) - failed
-	fmt.Fprintf(os.Stderr, "done: %d succeeded, %d failed (of %d)\n", succeeded, failed, len(targets))
+	jobs := make(chan job)
+	results := make(chan error)
+
+	// Start the worker pool: each worker pulls jobs until the channel is closed.
+	var wg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				results <- fetch(ctx, j.url, j.dst, timeout)
+			}
+		}()
+	}
+
+	// Producer: feed jobs to the workers, stopping early if ctx is canceled.
+	go func() {
+		defer close(jobs)
+		for url, dst := range targets {
+			select {
+			case jobs <- job{url, dst}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// Closer: once every worker has exited, no more results will be sent.
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect every result until the results channel is closed.
+	var (
+		errs      []error
+		succeeded int
+	)
+	for err := range results {
+		if err != nil {
+			errs = append(errs, err)
+		} else {
+			succeeded++
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "done: %d succeeded, %d failed (of %d)\n", succeeded, len(errs), len(targets))
 	return errors.Join(errs...)
 }
 
