@@ -1,45 +1,78 @@
-// You can edit this code!
-// Click here and start typing.
+// Command fetcher downloads the contents of a URL and writes it to a file
+// or to standard output.
+//
+// Usage:
+//
+//	fetcher [-o output] [-timeout duration] <url>
+//
+// Examples:
+//
+//	fetcher https://example.com
+//	fetcher -o page.html https://example.com
+//	fetcher -timeout 5s -o - https://example.com
 package main
 
 import (
-	//"bufio"
+	"flag"
 	"fmt"
-	"net/http"
 	"io"
+	"net/http"
 	"os"
-	"log"
+	"time"
 )
 
 func main() {
-	resp, err := http.Get("http://www.microsoft.com")
+	output := flag.String("o", "-", `output file ("-" for standard output)`)
+	timeout := flag.Duration("timeout", 30*time.Second, "HTTP request timeout")
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [-o output] [-timeout duration] <url>\n", os.Args[0])
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+
+	if flag.NArg() != 1 {
+		flag.Usage()
+		os.Exit(2)
+	}
+
+	if err := fetch(flag.Arg(0), *output, *timeout); err != nil {
+		fmt.Fprintf(os.Stderr, "fetcher: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// fetch retrieves url and writes the response body to dst. If dst is "-" the
+// body is written to standard output; otherwise dst is treated as a file path.
+func fetch(url, dst string, timeout time.Duration) error {
+	client := &http.Client{Timeout: timeout}
+
+	resp, err := client.Get(url)
 	if err != nil {
-		fmt.Printf("Could not get URL: %v\n", err)
-		return
+		return fmt.Errorf("could not get %q: %w", url, err)
 	}
-	if resp.StatusCode >= 300 {
-		fmt.Printf("Wrong HTTP Status: %v\n", resp.Status)
-		return
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("unexpected HTTP status: %s", resp.Status)
 	}
 
-	//rdr := bufio.NewReader(resp.Body)
-	respBody, err := io.ReadAll(resp.Body)
-	//bodyString, err := rdr.ReadString('\n')
+	out := os.Stdout
+	if dst != "-" {
+		f, err := os.Create(dst)
+		if err != nil {
+			return fmt.Errorf("could not create %q: %w", dst, err)
+		}
+		defer f.Close()
+		out = f
+	}
 
+	n, err := io.Copy(out, resp.Body)
 	if err != nil {
-		fmt.Printf("Error reading body: %v\n", err)
-		return
+		return fmt.Errorf("error writing body: %w", err)
 	}
-	bodyString := string(respBody)
 
-	fmt.Printf("Status: %v\nBody:\n%v\n", resp.Status, bodyString)
-
-	file, err := os.Open("file.txt") // For read access.
-	if err != nil {
-		log.Fatal(err)
+	if dst != "-" {
+		fmt.Fprintf(os.Stderr, "wrote %d bytes to %s\n", n, dst)
 	}
-	file.Write([]byte(bodyString))
-
-	file.Close()
-
+	return nil
 }
