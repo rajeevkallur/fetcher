@@ -123,6 +123,41 @@ func TestFetchAllReportsErrors(t *testing.T) {
 	}
 }
 
+func TestFetchAllReportsAllErrors(t *testing.T) {
+	// Return a different status code per path so each failure is distinct.
+	status := map[string]int{
+		"/a": http.StatusNotFound,
+		"/b": http.StatusInternalServerError,
+		"/c": http.StatusForbidden,
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nope", status[r.URL.Path])
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	targets := map[string]string{
+		srv.URL + "/a": filepath.Join(dir, "a.txt"),
+		srv.URL + "/b": filepath.Join(dir, "b.txt"),
+		srv.URL + "/c": filepath.Join(dir, "c.txt"),
+	}
+
+	err := fetchAll(context.Background(), targets, 5*time.Second, 2)
+	if err == nil {
+		t.Fatal("expected an error when downloads fail, got nil")
+	}
+
+	// errors.Join reports every failure: all three statuses must be present.
+	for _, code := range []string{"404", "500", "403"} {
+		if !strings.Contains(err.Error(), code) {
+			t.Errorf("error %q does not mention status %s", err, code)
+		}
+	}
+	if got := strings.Count(err.Error(), "unexpected HTTP status"); got != len(targets) {
+		t.Errorf("got %d status errors, want %d", got, len(targets))
+	}
+}
+
 func TestLoadTargets(t *testing.T) {
 	dir := t.TempDir()
 	listPath := filepath.Join(dir, "urls.txt")
