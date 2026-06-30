@@ -19,6 +19,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -27,7 +28,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -88,34 +89,41 @@ func main() {
 
 // fetchAll downloads every url in targets concurrently. It uses an errgroup
 // whose limit caps the number of in-flight downloads at concurrency (a bounded
-// worker pool). The group's context is canceled as soon as any download fails,
-// or when the caller cancels ctx (e.g. on Ctrl-C), which aborts the remaining
-// in-flight requests. It prints a summary to standard error and returns the
-// first error encountered, if any.
+// worker pool). Every target is attempted regardless of individual failures;
+// the errors are collected and returned together via errors.Join. Cancellation
+// of ctx (e.g. on Ctrl-C) still aborts in-flight requests. It prints a summary
+// to standard error.
 func fetchAll(ctx context.Context, targets map[string]string, timeout time.Duration, concurrency int) error {
 	if concurrency < 1 {
 		concurrency = 1
 	}
 
-	g, ctx := errgroup.WithContext(ctx)
+	// Plain errgroup (no WithContext) so one failure does not cancel the rest;
+	// Ctrl-C cancellation is carried by the caller-supplied ctx instead.
+	var g errgroup.Group
 	g.SetLimit(concurrency) // bounded pool: at most concurrency goroutines run at once
 
-	var succeeded atomic.Int64
+	var (
+		mu   sync.Mutex
+		errs []error
+	)
 	for url, dst := range targets {
 		g.Go(func() error {
 			if err := fetch(ctx, url, dst, timeout); err != nil {
-				return err
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
 			}
-			succeeded.Add(1)
-			return nil
+			return nil // never cancel siblings; failures are collected above
 		})
 	}
 
-	err := g.Wait() // blocks until all goroutines finish or one fails
+	g.Wait() // blocks until every download has finished
 
-	ok := int(succeeded.Load())
-	fmt.Fprintf(os.Stderr, "done: %d succeeded, %d failed (of %d)\n", ok, len(targets)-ok, len(targets))
-	return err
+	failed := len(errs)
+	succeeded := len(targets) - failed
+	fmt.Fprintf(os.Stderr, "done: %d succeeded, %d failed (of %d)\n", succeeded, failed, len(targets))
+	return errors.Join(errs...)
 }
 
 // loadTargets reads URL/output-file pairs from path. Each non-empty, non-comment

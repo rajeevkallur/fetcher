@@ -22,8 +22,9 @@ fetcher [-o output] [-timeout duration] [-c n] [-list file] [url]
 - `-list file` downloads every `url [output]` line in the file **concurrently**.
 - With **no arguments**, a built-in set of URLs is downloaded concurrently.
 
-Concurrent downloads run in a bounded worker pool (`-c`). If any download fails,
-or you press Ctrl-C, the remaining in-flight downloads are canceled.
+Concurrent downloads run in a bounded worker pool (`-c`). Every URL is attempted
+regardless of individual failures, and all errors are reported together. Pressing
+Ctrl-C cancels any in-flight downloads.
 
 Flags:
 
